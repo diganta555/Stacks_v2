@@ -1,3 +1,237 @@
+# How Stacks Works
+
+This describes what actually happens inside the app when you use it —
+not the code layout (see `README.md` for that), but the behavior: what
+happens to your data, step by step, from upload to answer.
+
+The app has two independent halves that don't share data with each
+other: **Tabular Data** (CSV/Excel) and **Documents** (PDF/Word/text/etc.,
+searched via RAG). Pick the section below for what you're using.
+
+---
+
+# Part 1: Tabular Data (CSV / Excel)
+
+## 1. Upload
+
+You upload a `.csv`, `.xlsx`, or `.xls` file. The app:
+
+1. Parses it into a table (pandas DataFrame).
+2. Validates it — rejects it (with a message, not a crash) if the file
+   is empty, unreadable, or an unsupported format.
+3. Warns you (but doesn't block you) if it's over ~2 million rows, since
+   some operations below get slow at that scale.
+4. Remembers this table as "the current dataset" for the rest of your
+   session.
+
+**Important behavior:** if you upload a *different* file later, the app
+detects that (by filename + size) and wipes anything tied to the
+previous dataset — cleaned data, AI reports, chat history — so you don't
+accidentally see leftovers from the old file mixed with the new one. If
+you re-upload the *same* file (e.g. the page just reran), nothing resets;
+your work is preserved.
+
+## 2. What gets computed once, up front
+
+Before any page renders, the app scans your table once and works out:
+which columns are numeric, which are categorical/text, which are
+dates, how many missing values and duplicate rows exist, and which
+columns are "constant" (only one unique value — usually a sign the
+column isn't useful). Every page below uses this same information rather
+than recalculating it, so the numbers are always consistent across pages.
+
+## 3. The 20 pages, grouped
+
+### 🔍 Explore (read-only — nothing here changes your data)
+
+- **Dataset Overview** — row/column counts, a preview of the first 100
+  rows, and a per-column data-type breakdown.
+- **Data Quality** — missing values, duplicate rows, and constant
+  columns, with a plain-language verdict ("Excellent" / "Attention
+  required").
+- **Statistical Analysis** — mean/median/std/percentiles for every
+  numeric column, plus a deep-dive on one column at a time.
+- **Exploratory Analytics** — distributions, top categorical values,
+  a correlation matrix across numeric columns, grouped aggregations
+  (e.g. "average X by Y"), and top/bottom-N record rankings.
+- **Automatic Visualization** — the app looks at what column types you
+  have and offers only the charts that make sense (histograms, trend
+  lines, scatter plots, bar charts, correlation heatmaps).
+- **Anomaly Detection** — flags statistical outliers per column using
+  either the IQR method or Z-scores, plus a one-click scan across every
+  numeric column at once.
+
+### 🧹 Clean & Transform (these DO change your working data)
+
+- **Data Cleaning** — detects issues (missing values, duplicates,
+  constant columns) and lets you preview a fix before applying it:
+  remove duplicates, fill missing values (mean/median/mode/"Unknown"),
+  drop incomplete rows, drop constant columns, or force a column to
+  numeric. Has undo (one step back) and a full reset to the originally
+  uploaded file.
+- **Dataset Profiling** — a deeper automatic report: a 0–100 "health
+  score," per-column roles and cardinality, skewness, and outlier counts.
+- **Data Transformation** — rename columns, convert types (int/float/
+  string/boolean/datetime), build a calculated column from two numeric
+  columns (+/−/×/÷), extract date parts (year/month/day/etc.), normalize
+  or standardize a numeric column, and text case/whitespace cleanup.
+
+**Once you clean or transform something here, every other page — Explore,
+AI, Export — sees the updated data, not the original upload.** This is
+one shared working copy, not 20 independent views.
+
+### 🤖 AI Assistants (send a summary of your data to Groq — see note below)
+
+- **AI Data Quality Report** — turns the Data Quality findings into a
+  business-readable report with severity ratings (HIGH/MEDIUM/LOW).
+- **AI Cleaning Assistant** — proposes a cleaning plan in plain language;
+  nothing is applied until you explicitly select an operation and check
+  an approval box.
+- **Natural Language SQL** — type a question in English, the AI writes
+  a DuckDB SQL query against your data, and it's checked against a
+  keyword blocklist (only `SELECT`/`WITH`, no `DROP`/`DELETE`/etc.)
+  before it's allowed to run.
+- **AI Data Analyst** — free-form Q&A ("what are the biggest risks in
+  this data?") answered against a profile of your dataset's shape and
+  statistics.
+- **GPT Insights** — generates a fixed number of structured
+  Finding → Evidence → Recommendation cards.
+- **AI Chart Recommendation** — describe what you want to see; the AI
+  picks a chart type and columns, which are then validated against your
+  actual schema before anything renders (it can't invent columns that
+  don't exist).
+- **AI Transformation (natural language)** — describe a transformation
+  in English; the AI explains what it *would* do, but doesn't execute
+  arbitrary code — actual transformations still happen through the
+  Data Transformation page's fixed set of operations.
+- **Business Insights** — answers a specific business question with an
+  executive-style Findings/Risks/Recommendations/Confidence writeup.
+- **AI Analyst Chat** — a running conversation about your dataset,
+  remembering the last 10 exchanges as context.
+
+> **What's actually sent to the AI:** column names, data types, summary
+> statistics, and a small sample of rows (typically 10–20) — not
+> necessarily your whole file. Every AI page shows a one-line notice
+> before you use it. Don't use these features on data you can't share
+> with a third-party API (Groq).
+
+### 📤 Export
+
+- **Export & Reports** — download the current (possibly cleaned)
+  dataset as CSV, and generate/download a compiled plain-text report
+  covering quality, statistics, and any AI outputs you've already
+  generated elsewhere in the session.
+
+### 🏠 Overview
+
+- **Executive Dashboard** — a final summary: health score, which AI
+  features you've run this session, and one-click download/reset
+  controls (including a "clear AI session" button that wipes generated
+  reports without touching your actual data).
+
+## 4. What doesn't persist
+
+Everything above lives in the browser session only. Close the tab or
+restart the app, and you're back to nothing uploaded — nothing is
+written to a database. The only thing that touches disk is a CSV/report
+you explicitly click "Download" for.
+
+---
+
+# Part 2: Documents (non-tabular — PDF, Word, text, etc.)
+
+This is a separate system: retrieval-augmented generation (RAG). Instead
+of running code against your data like the Tabular tab, it converts your
+documents into searchable "meaning," then asks an AI to answer questions
+using only the relevant pieces it finds.
+
+## 1. Upload & loading
+
+You upload one or more files. Supported types: PDF, TXT, CSV, Excel,
+Word (`.docx`), JSON, Markdown. Each format is read differently:
+
+- **PDF / Word / plain text** — extracted as continuous text.
+- **CSV / Excel** — turned into one record per row (each row becomes its
+  own searchable unit, not one giant blob of text).
+- **JSON** — one record per list item if it's a list, or the whole
+  structure as one unit otherwise.
+
+Multiple files load in parallel (up to 8 at once) for speed. A file that
+fails to load doesn't block the others — you get a per-file success/error
+status.
+
+## 2. Chunking & embedding
+
+Long documents (PDF, Word, text, Markdown) are split into overlapping
+~1000-character chunks so a single question doesn't require the AI to
+digest an entire 50-page PDF at once. Row/record-based formats (CSV,
+JSON, Excel) are **not** split further — a single row is already a
+sensible atomic unit and splitting it further would fragment it for no
+benefit.
+
+Every chunk is converted into a vector embedding (a numeric fingerprint
+of its meaning) using a local embedding model (`all-MiniLM-L6-v2`) —
+this runs on your machine, not sent to any external API.
+
+## 3. Storage
+
+Embeddings go into a FAISS vector index; the chunk text and source
+filename go into an accompanying metadata store. Both are saved to disk
+(`faiss_store/`), so your indexed library survives an app restart — you
+don't need to re-upload and re-index everything every session.
+
+## 4. Removing a document
+
+Deleting a filed document removes its chunks from the index. Depending
+on which version of the vectorstore code you're running, this either:
+rebuilds the entire index from every remaining file on disk (safe, but
+slower as your library grows), or surgically removes just that file's
+chunks from memory without touching anything else (faster — see
+`src_patches/` in the code architecture doc if this hasn't been applied
+yet).
+
+## 5. Asking a question
+
+This is the actual "RAG" part, and it happens in three stages:
+
+1. **Retrieval** — your question is compared against every stored chunk
+   two ways at once: vector similarity (meaning-based) and BM25 keyword
+   search (exact-term-based), then the two rankings are merged
+   (reciprocal rank fusion) so both "semantically similar" and
+   "contains the exact words" results surface. The merged candidates are
+   then re-ordered by a cross-encoder re-ranking model for a final,
+   more accurate top-K.
+2. **Prompting** — the top-K chunks are assembled into a prompt that
+   tells the AI: *answer using only this context; say so if the answer
+   isn't covered; cite sources by filename.*
+3. **Generation** — the prompt goes to Groq's API, and the answer streams
+   back into the chat in real time rather than appearing all at once.
+
+The filenames the answer drew from are shown as source chips underneath
+the answer, so you can verify where a claim came from.
+
+## 6. What happens if there's no good match
+
+If nothing in your indexed documents is relevant to the question, you
+get "No relevant documents found" instead of an AI-invented answer — the
+system doesn't fall back to the model's general knowledge.
+
+## 7. Rate limits
+
+If Groq's daily free-tier limit is hit mid-conversation, you get a clear
+"Daily usage limit reached" message (with a retry-time estimate when
+Groq provides one) instead of a raw stack trace.
+
+---
+
+## The one thing that's shared between the two tabs
+
+Nothing, by design. A Tabular Data upload has no effect on your indexed
+Documents library, and vice versa — they use completely separate storage
+(`session_state.tabular_df` vs. `faiss_store/` on disk) and separate AI
+call paths (dataset-summary prompts vs. retrieved-chunk prompts).
+
+
 # Stacks — Architecture
 
 Stacks is a Streamlit app with two tabs:
